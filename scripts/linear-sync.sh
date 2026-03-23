@@ -29,6 +29,7 @@ if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 : "${LINEAR_STATE_HUMAN_REVIEW:?Set LINEAR_STATE_HUMAN_REVIEW in .env}"
 : "${LINEAR_STATE_CODE_REVIEW:=${LINEAR_STATE_HUMAN_REVIEW}}"
 : "${LINEAR_STATE_TODO:=c184b789-8a72-4890-a5cf-e9da56175a0e}"
+: "${LINEAR_STATE_DONE:=e052dd42-2d08-46cf-b065-82f588c3f806}"
 
 LOG_FILE="$SCRIPT_DIR/linear-sync.log"
 ROTATION_FILE="$SCRIPT_DIR/.review-rotation"
@@ -105,7 +106,28 @@ for n in json.load(sys.stdin)['data']['team']['issues']['nodes']:
         # Still being worked on — skip
         if echo "$ACTIVE_BEADS" | grep -q "$identifier" 2>/dev/null; then continue; fi
 
-        # No active bead — check if the stage completed (comment exists on Linear)
+        # No active bead — check if the work was already merged (closed bead).
+        # If so, move Linear to Done and skip. This prevents re-dispatching
+        # completed work when the polecat finished but didn't update Linear.
+        was_merged=$(cd "$GT_ROOT" && bd list --all --rig "$GT_RIG" --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    for i in sorted(json.load(sys.stdin), key=lambda x: x.get('updated_at',''), reverse=True):
+        if '$identifier' in i.get('title', '') and i.get('status') == 'closed':
+            desc = i.get('description', '')
+            if 'merge' in desc.lower() or i.get('close_reason', ''):
+                print('yes'); break
+except: pass
+" 2>/dev/null || true)
+
+        if [ "$was_merged" = "yes" ]; then
+            log "SYNC: $identifier already merged — moving to Done"
+            move_to_state "$issue_uuid" "$LINEAR_STATE_DONE"
+            MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
+            continue
+        fi
+
+        # Check if the stage completed (comment exists on Linear)
         last_stage=$(get_last_stage "$identifier")
 
         if [ "$last_stage" != "none" ]; then
