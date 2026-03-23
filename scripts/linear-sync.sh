@@ -149,31 +149,51 @@ for n in json.load(sys.stdin)['data']['team']['issues']['nodes']:
             continue
         fi
 
-        # Check if the stage completed (comment posted to Linear)
+        # Determine what stage completed. Check both Linear comments AND the
+        # most recent closed bead's description (polecat may finish without posting).
         last_stage=$(get_last_stage "$identifier")
 
-        if [ "$last_stage" != "none" ]; then
+        # Also check the bead to see what stage was dispatched
+        bead_id=$(dolt_query "SELECT id FROM issues WHERE title LIKE '${identifier}:%' AND status = 'closed' ORDER BY updated_at DESC LIMIT 1")
+        bead_stage=""
+        if [ -n "$bead_id" ]; then
+            bead_stage=$(dolt_query "SELECT description FROM issues WHERE id = '$bead_id'" | \
+                python3 -c "
+import sys
+d = sys.stdin.read().strip()
+if 'merge stage' in d: print('code-review')
+elif 'code-review stage' in d: print('code-review')
+elif 'implement stage' in d: print('implementation')
+elif 'investigate stage' in d: print('investigation')
+else: print('none')
+" 2>/dev/null || echo "none")
+        fi
+
+        # Use whichever gives more information — prefer bead stage if Linear
+        # comments are stale (common when polecat finishes without posting)
+        effective_stage="$last_stage"
+        if [ "$last_stage" = "none" ] && [ "$bead_stage" != "none" ] && [ -n "$bead_stage" ]; then
+            effective_stage="$bead_stage"
+            log "  Using bead stage ($bead_stage) — no matching Linear comment found"
+        elif [ "$bead_stage" != "none" ] && [ -n "$bead_stage" ] && [ "$bead_stage" != "$last_stage" ]; then
+            # Bead shows a later stage than Linear comments — use bead
+            effective_stage="$bead_stage"
+            log "  Bead stage ($bead_stage) is newer than Linear comment stage ($last_stage)"
+        fi
+
+        if [ "$effective_stage" != "none" ]; then
             # Stage completed — advance to next gate
-            if [ "$last_stage" = "implementation" ]; then
+            if [ "$effective_stage" = "implementation" ]; then
                 target_state="$LINEAR_STATE_CODE_REVIEW"
                 target_name="Code Review"
             else
                 target_state="$LINEAR_STATE_HUMAN_REVIEW"
                 target_name="Human Review"
             fi
-            log "SYNC: $identifier ($last_stage done) → $target_name"
-            move_to_state "$issue_uuid" "$target_state"
-            MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
-        else
-            # No Linear comment yet — try to recover findings from closed bead
-            bead_id=$(dolt_query "SELECT id FROM issues WHERE title LIKE '${identifier}:%' AND status = 'closed' ORDER BY updated_at DESC LIMIT 1")
 
-            if [ -z "$bead_id" ]; then
-                log "STUCK: $identifier — no active bead, no closed bead, no Linear comment. Leaving In Progress."
-                continue
-            fi
-
-            findings=$(cd "$GT_ROOT" && bd show "$bead_id" --json 2>/dev/null | python3 -c "
+            # Try to recover and post findings if they're not already on Linear
+            if [ -n "$bead_id" ] && [ "$last_stage" != "$effective_stage" ]; then
+                findings=$(cd "$GT_ROOT" && bd show "$bead_id" --json 2>/dev/null | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -185,14 +205,13 @@ try:
 except: pass
 " 2>/dev/null || true)
 
-            if [ -n "$findings" ]; then
-                log "Posting recovered findings for $identifier from bead $bead_id"
-                stage_header="## Investigation"
-                if cd "$GT_ROOT" && bd show "$bead_id" 2>/dev/null | grep -qi "implement"; then
-                    stage_header="## Implementation"
-                fi
+                if [ -n "$findings" ]; then
+                    stage_header="## Investigation"
+                    if [ "$effective_stage" = "implementation" ]; then stage_header="## Implementation"; fi
+                    if [ "$effective_stage" = "code-review" ]; then stage_header="## Code Review"; fi
 
-                python3 -c "
+                    log "  Posting recovered findings for $identifier ($effective_stage)"
+                    python3 -c "
 import json, sys
 body = '''$stage_header
 
@@ -205,22 +224,18 @@ payload = {
 }
 json.dump(payload, sys.stdout)
 " | curl -s --max-time 15 -X POST https://api.linear.app/graphql \
-                    -H "Authorization: $LINEAR_API_KEY" \
-                    -H "Content-Type: application/json" \
-                    -d @- > /dev/null
-
-                if echo "$stage_header" | grep -qi "implementation"; then
-                    recovery_state="$LINEAR_STATE_CODE_REVIEW"
-                else
-                    recovery_state="$LINEAR_STATE_HUMAN_REVIEW"
+                        -H "Authorization: $LINEAR_API_KEY" \
+                        -H "Content-Type: application/json" \
+                        -d @- > /dev/null
                 fi
-                move_to_state "$issue_uuid" "$recovery_state"
-                MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
-            else
-                # No findings — leave it In Progress. Do NOT bounce to Todo.
-                # The human can manually move it if needed.
-                log "STUCK: $identifier — bead $bead_id closed with no findings. Leaving In Progress for human triage."
             fi
+
+            log "SYNC: $identifier ($effective_stage done) → $target_name"
+            move_to_state "$issue_uuid" "$target_state"
+            MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
+        else
+            # No stage determined from Linear comments or bead — truly stuck
+            log "STUCK: $identifier — no stage info found. Leaving In Progress for human triage."
         fi
     done
 fi
