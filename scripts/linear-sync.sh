@@ -1,12 +1,12 @@
 #!/bin/bash
-# Linear Pipeline Sync v2 — Polls Linear and dispatches polecats via Gas Town.
+# Linear Pipeline Sync v3 — Polls Linear and dispatches polecats via Gas Town.
 #
-# v2 changes:
-# - Removed polecat cleanup (Phase 0) — GT Witness handles polecat lifecycle
-# - Kept bead-recovery logic from Phase 0.5 for Linear sync-back: if a polecat
-#   completes without posting to Linear, we recover findings from the bead and
-#   post them. Witness handles the GT side (restart/cleanup), we handle Linear.
-# - Dispatch logic unchanged
+# v3 changes (from v2):
+# - Restored Phase 0: clean up idle/done polecats before checking for stuck work
+# - All bead queries use Dolt directly (bd list --rig routing is unreliable)
+# - Fixed merge detection: only matches beads with 'merge' in description/close_reason
+# - Removed dangerous "move back to Todo" fallback that caused bounce loops
+# - Added dedup check before dispatch to prevent duplicate polecats
 #
 # Configure via .env at the path specified by ENV_FILE below.
 set -euo pipefail
@@ -30,6 +30,7 @@ if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 : "${LINEAR_STATE_CODE_REVIEW:=${LINEAR_STATE_HUMAN_REVIEW}}"
 : "${LINEAR_STATE_TODO:=c184b789-8a72-4890-a5cf-e9da56175a0e}"
 : "${LINEAR_STATE_DONE:=e052dd42-2d08-46cf-b065-82f588c3f806}"
+: "${DOLT_PORT:=3307}"
 
 LOG_FILE="$SCRIPT_DIR/linear-sync.log"
 ROTATION_FILE="$SCRIPT_DIR/.review-rotation"
@@ -51,6 +52,11 @@ linear_query() {
 
 move_to_state() {
     linear_query "{\"query\": \"mutation { issueUpdate(id: \\\"$1\\\", input: { stateId: \\\"$2\\\" }) { success } }\"}" > /dev/null
+}
+
+# Query rig's Dolt database directly — bd list --rig routing is unreliable
+dolt_query() {
+    mysql -h 127.0.0.1 -P "$DOLT_PORT" -u root "$GT_RIG" -N -e "$1" 2>/dev/null || true
 }
 
 get_last_stage() {
@@ -84,42 +90,58 @@ next_reviewer() {
 }
 
 # ---------------------------------------------------------------------------
+# Phase 0: Clean up idle/done polecats
+# ---------------------------------------------------------------------------
+log "Starting linear-sync"
+
+FINISHED_POLECATS=$(cd "$GT_ROOT" && gt polecat list --all 2>/dev/null | grep -E "idle|done" || true)
+if [ -n "$FINISHED_POLECATS" ]; then
+    echo "$FINISHED_POLECATS" | while read -r line; do
+        polecat_name=$(echo "$line" | awk '{print $2}')
+        if [ -n "$polecat_name" ]; then
+            log "Cleaning up finished polecat: $polecat_name"
+            cd "$GT_ROOT" && gt polecat nuke "$polecat_name" --force >> "$LOG_FILE" 2>&1 || true
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Phase 1: Sync completed work back to Linear
 # ---------------------------------------------------------------------------
-# Check "In Progress" issues in Linear. If no GT bead is actively working on
-# one, the polecat either completed or died. Witness handles the GT side
-# (restart/cleanup). We just sync the Linear state forward if work is done.
-
-log "Starting linear-sync"
+# Check "In Progress" issues in Linear. If no polecat is actively working on
+# one, sync the Linear state forward based on what was accomplished.
 
 IP_ISSUES=$(linear_query "{\"query\": \"{ team(id: \\\"$LINEAR_TEAM_ID\\\") { issues(filter: { project: { slugId: { eq: \\\"$LINEAR_PROJECT_SLUG\\\" } }, state: { name: { eq: \\\"In Progress\\\" } } }) { nodes { id identifier title } } } }\"}")
 IP_COUNT=$(echo "$IP_ISSUES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['data']['team']['issues']['nodes']))" 2>/dev/null || echo "0")
 
 if [ "$IP_COUNT" != "0" ]; then
-    ACTIVE_BEADS=$(cd "$GT_ROOT" && bd list --status=hooked --status=in_progress --rig "$GT_RIG" 2>/dev/null || true)
+    # Check both Dolt beads AND working polecats for active work detection
+    ACTIVE_BEADS=$(dolt_query "SELECT CONCAT(id, ' ', title) FROM issues WHERE status IN ('hooked','in_progress')")
+    WORKING_POLECATS=$(cd "$GT_ROOT" && gt polecat list --all 2>/dev/null | grep "working" || true)
 
     echo "$IP_ISSUES" | python3 -c "
 import sys, json
 for n in json.load(sys.stdin)['data']['team']['issues']['nodes']:
     print(f\"{n['identifier']}|{n['id']}\")
 " | while IFS='|' read -r identifier issue_uuid; do
-        # Still being worked on — skip
-        if echo "$ACTIVE_BEADS" | grep -q "$identifier" 2>/dev/null; then continue; fi
+        # Check if actively being worked — via bead status OR working polecat
+        if echo "$ACTIVE_BEADS" | grep -q "$identifier" 2>/dev/null; then
+            log "ACTIVE: $identifier has hooked/in_progress bead — skipping"
+            continue
+        fi
+        if [ -n "$WORKING_POLECATS" ] && echo "$WORKING_POLECATS" | grep -q "working" 2>/dev/null; then
+            # Double-check: is any working polecat's bead for this issue?
+            for pc_bead in $(echo "$WORKING_POLECATS" | awk 'NR%2==0{print $1}'); do
+                pc_title=$(dolt_query "SELECT title FROM issues WHERE id='$pc_bead' LIMIT 1")
+                if echo "$pc_title" | grep -q "$identifier" 2>/dev/null; then
+                    log "ACTIVE: $identifier has working polecat (bead $pc_bead) — skipping"
+                    continue 2
+                fi
+            done
+        fi
 
-        # No active bead — check if the work was already merged (closed bead).
-        # If so, move Linear to Done and skip. This prevents re-dispatching
-        # completed work when the polecat finished but didn't update Linear.
-        was_merged=$(cd "$GT_ROOT" && bd list --all --rig "$GT_RIG" --json 2>/dev/null | python3 -c "
-import sys, json
-try:
-    for i in sorted(json.load(sys.stdin), key=lambda x: x.get('updated_at',''), reverse=True):
-        if '$identifier' in i.get('title', '') and i.get('status') == 'closed':
-            desc = i.get('description', '')
-            if 'merge' in desc.lower() or i.get('close_reason', ''):
-                print('yes'); break
-except: pass
-" 2>/dev/null || true)
-
+        # No active work — check if already merged
+        was_merged=$(dolt_query "SELECT 'yes' FROM issues WHERE title LIKE '${identifier}:%' AND status = 'closed' AND (description LIKE '%merge stage%' OR close_reason LIKE '%merge%') LIMIT 1")
         if [ "$was_merged" = "yes" ]; then
             log "SYNC: $identifier already merged — moving to Done"
             move_to_state "$issue_uuid" "$LINEAR_STATE_DONE"
@@ -127,11 +149,11 @@ except: pass
             continue
         fi
 
-        # Check if the stage completed (comment exists on Linear)
+        # Check if the stage completed (comment posted to Linear)
         last_stage=$(get_last_stage "$identifier")
 
         if [ "$last_stage" != "none" ]; then
-            # Stage completed but Linear still shows In Progress — sync it forward
+            # Stage completed — advance to next gate
             if [ "$last_stage" = "implementation" ]; then
                 target_state="$LINEAR_STATE_CODE_REVIEW"
                 target_name="Code Review"
@@ -143,18 +165,13 @@ except: pass
             move_to_state "$issue_uuid" "$target_state"
             MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
         else
-            # No Linear comment — polecat may have completed without posting.
-            # Try to recover findings from the bead and post them to Linear.
-            bead_id=$(cd "$GT_ROOT" && bd list --all --rig "$GT_RIG" --json 2>/dev/null | python3 -c "
-import sys, json
-try:
-    for i in sorted(json.load(sys.stdin), key=lambda x: x.get('updated_at',''), reverse=True):
-        if '$identifier' in i.get('title', ''):
-            print(i['id']); break
-except: pass
-" 2>/dev/null || true)
+            # No Linear comment yet — try to recover findings from closed bead
+            bead_id=$(dolt_query "SELECT id FROM issues WHERE title LIKE '${identifier}:%' AND status = 'closed' ORDER BY updated_at DESC LIMIT 1")
 
-            if [ -z "$bead_id" ]; then continue; fi
+            if [ -z "$bead_id" ]; then
+                log "STUCK: $identifier — no active bead, no closed bead, no Linear comment. Leaving In Progress."
+                continue
+            fi
 
             findings=$(cd "$GT_ROOT" && bd show "$bead_id" --json 2>/dev/null | python3 -c "
 import sys, json
@@ -169,7 +186,7 @@ except: pass
 " 2>/dev/null || true)
 
             if [ -n "$findings" ]; then
-                log "Posting recovered findings for $identifier"
+                log "Posting recovered findings for $identifier from bead $bead_id"
                 stage_header="## Investigation"
                 if cd "$GT_ROOT" && bd show "$bead_id" 2>/dev/null | grep -qi "implement"; then
                     stage_header="## Implementation"
@@ -181,7 +198,7 @@ body = '''$stage_header
 
 $findings
 
-_Agent: sync-timer (recovered from bead)_'''
+_Agent: sync-timer (recovered from bead $bead_id)_'''
 payload = {
     'query': 'mutation(\$input: CommentCreateInput!) { commentCreate(input: \$input) { success } }',
     'variables': {'input': {'issueId': '$issue_uuid', 'body': body}}
@@ -200,10 +217,9 @@ json.dump(payload, sys.stdout)
                 move_to_state "$issue_uuid" "$recovery_state"
                 MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
             else
-                # No findings in bead either — move back to Todo for re-dispatch
-                log "RECOVER: $identifier stuck with no findings — moving back to Todo"
-                move_to_state "$issue_uuid" "$LINEAR_STATE_TODO"
-                MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
+                # No findings — leave it In Progress. Do NOT bounce to Todo.
+                # The human can manually move it if needed.
+                log "STUCK: $identifier — bead $bead_id closed with no findings. Leaving In Progress for human triage."
             fi
         fi
     done
@@ -284,6 +300,13 @@ for n in json.load(sys.stdin)['data']['team']['issues']['nodes']:
     fi
 
     log "$identifier -> $stage (agent=$agent)"
+
+    # Dedup: check for existing in-flight bead for this issue
+    existing=$(dolt_query "SELECT id FROM issues WHERE title LIKE '${identifier}:%' AND status IN ('hooked','in_progress','open') LIMIT 1")
+    if [ -n "$existing" ]; then
+        log "SKIP: $identifier already has in-flight bead $existing in $GT_RIG"
+        continue
+    fi
 
     # Create bead and dispatch
     bead_id=$(cd "$GT_ROOT" && bd create --rig "$GT_RIG" \
