@@ -3,8 +3,9 @@
 #
 # v2 changes:
 # - Removed polecat cleanup (Phase 0) — GT Witness handles polecat lifecycle
-# - Replaced stuck-issue recovery (Phase 0.5) with lightweight Linear sync-back
-#   that only handles the Linear side; GT Witness handles polecat restarts/cleanup
+# - Kept bead-recovery logic from Phase 0.5 for Linear sync-back: if a polecat
+#   completes without posting to Linear, we recover findings from the bead and
+#   post them. Witness handles the GT side (restart/cleanup), we handle Linear.
 # - Dispatch logic unchanged
 #
 # Configure via .env at the path specified by ENV_FILE below.
@@ -27,6 +28,7 @@ if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 : "${LINEAR_STATE_IN_PROGRESS:?Set LINEAR_STATE_IN_PROGRESS in .env}"
 : "${LINEAR_STATE_HUMAN_REVIEW:?Set LINEAR_STATE_HUMAN_REVIEW in .env}"
 : "${LINEAR_STATE_CODE_REVIEW:=${LINEAR_STATE_HUMAN_REVIEW}}"
+: "${LINEAR_STATE_TODO:=c184b789-8a72-4890-a5cf-e9da56175a0e}"
 
 LOG_FILE="$SCRIPT_DIR/linear-sync.log"
 ROTATION_FILE="$SCRIPT_DIR/.review-rotation"
@@ -105,19 +107,83 @@ for n in json.load(sys.stdin)['data']['team']['issues']['nodes']:
 
         # No active bead — check if the stage completed (comment exists on Linear)
         last_stage=$(get_last_stage "$identifier")
-        if [ "$last_stage" = "none" ]; then continue; fi
 
-        # Stage completed but Linear still shows In Progress — sync it forward
-        if [ "$last_stage" = "implementation" ]; then
-            target_state="$LINEAR_STATE_CODE_REVIEW"
-            target_name="Code Review"
+        if [ "$last_stage" != "none" ]; then
+            # Stage completed but Linear still shows In Progress — sync it forward
+            if [ "$last_stage" = "implementation" ]; then
+                target_state="$LINEAR_STATE_CODE_REVIEW"
+                target_name="Code Review"
+            else
+                target_state="$LINEAR_STATE_HUMAN_REVIEW"
+                target_name="Human Review"
+            fi
+            log "SYNC: $identifier ($last_stage done) → $target_name"
+            move_to_state "$issue_uuid" "$target_state"
+            MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
         else
-            target_state="$LINEAR_STATE_HUMAN_REVIEW"
-            target_name="Human Review"
+            # No Linear comment — polecat may have completed without posting.
+            # Try to recover findings from the bead and post them to Linear.
+            bead_id=$(cd "$GT_ROOT" && bd list --all --rig "$GT_RIG" --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    for i in sorted(json.load(sys.stdin), key=lambda x: x.get('updated_at',''), reverse=True):
+        if '$identifier' in i.get('title', ''):
+            print(i['id']); break
+except: pass
+" 2>/dev/null || true)
+
+            if [ -z "$bead_id" ]; then continue; fi
+
+            findings=$(cd "$GT_ROOT" && bd show "$bead_id" --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list): d = d[0]
+    design = d.get('design', '')
+    notes = d.get('notes', '')
+    if design and len(design) > 50: print(design)
+    elif notes and len(notes) > 20: print(notes)
+except: pass
+" 2>/dev/null || true)
+
+            if [ -n "$findings" ]; then
+                log "Posting recovered findings for $identifier"
+                stage_header="## Investigation"
+                if cd "$GT_ROOT" && bd show "$bead_id" 2>/dev/null | grep -qi "implement"; then
+                    stage_header="## Implementation"
+                fi
+
+                python3 -c "
+import json, sys
+body = '''$stage_header
+
+$findings
+
+_Agent: sync-timer (recovered from bead)_'''
+payload = {
+    'query': 'mutation(\$input: CommentCreateInput!) { commentCreate(input: \$input) { success } }',
+    'variables': {'input': {'issueId': '$issue_uuid', 'body': body}}
+}
+json.dump(payload, sys.stdout)
+" | curl -s --max-time 15 -X POST https://api.linear.app/graphql \
+                    -H "Authorization: $LINEAR_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    -d @- > /dev/null
+
+                if echo "$stage_header" | grep -qi "implementation"; then
+                    recovery_state="$LINEAR_STATE_CODE_REVIEW"
+                else
+                    recovery_state="$LINEAR_STATE_HUMAN_REVIEW"
+                fi
+                move_to_state "$issue_uuid" "$recovery_state"
+                MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
+            else
+                # No findings in bead either — move back to Todo for re-dispatch
+                log "RECOVER: $identifier stuck with no findings — moving back to Todo"
+                move_to_state "$issue_uuid" "$LINEAR_STATE_TODO"
+                MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
+            fi
         fi
-        log "SYNC: $identifier ($last_stage done) → $target_name"
-        move_to_state "$issue_uuid" "$target_state"
-        MOVED_THIS_RUN="$MOVED_THIS_RUN $identifier"
     done
 fi
 
