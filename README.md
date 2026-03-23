@@ -117,17 +117,40 @@ After the bot is deployed with a public URL:
 
 ### 6. Set up Gas Town (for AI agent dispatch)
 
+The sync timer uses [Gas Town](https://github.com/anthropics/gas-town) to dispatch
+AI agents (polecats) and manage their lifecycle. The Discord bot does **not** need
+Gas Town — it only talks to Discord and Linear.
+
+**What Gas Town provides:**
+- **Polecats** — Ephemeral AI worker agents that run in isolated git worktrees
+- **Witness** — Per-rig monitor that detects stuck/crashed polecats and restarts them
+- **Refinery** — Merge queue that handles rebase conflicts and serialized merging
+- **Beads** — Issue tracking backend (backed by Dolt database)
+
 ```bash
 # Install Gas Town
 # See: https://github.com/anthropics/gas-town
 
+# Start the Dolt database server (beads backend)
+gt dolt start
+
 # Add your project as a rig
 gt rig add myproject git@github.com:you/repo.git --prefix mp
 
-# Start the rig
+# Start the Gas Town daemon (manages witness + refinery per rig)
+gt up
+
+# The sync timer auto-undocks/docks rigs as work arrives,
+# but you can manually start a rig with:
 gt rig undock myproject
 gt rig start myproject
 ```
+
+**Configure agents** in your Gas Town settings if using non-Claude agents for
+code review rotation (see [Customization → Agent config](#agent-config) below).
+
+**Note:** `linear-sync.sh` needs `GT_ROOT` and `GT_RIG` set in `.env` to find
+your Gas Town workspace and target rig.
 
 ### 7. Set up the sync timer
 
