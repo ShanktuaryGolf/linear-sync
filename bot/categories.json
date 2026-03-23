@@ -1,0 +1,32 @@
+{
+    "bug": {
+        "name": "Bug",
+        "label_id": "",
+        "emoji": "🐛",
+        "description": "Something isn't working correctly"
+    },
+    "ui": {
+        "name": "UI / General",
+        "label_id": "",
+        "emoji": "🖥️",
+        "description": "Buttons, menus, settings, layout issues"
+    },
+    "performance": {
+        "name": "Performance",
+        "label_id": "",
+        "emoji": "⚡",
+        "description": "Slow, laggy, or resource-heavy behavior"
+    },
+    "feature": {
+        "name": "Feature Request",
+        "label_id": "",
+        "emoji": "💡",
+        "description": "Suggestion for a new feature or improvement"
+    },
+    "setup": {
+        "name": "Setup / Installation",
+        "label_id": "",
+        "emoji": "🔧",
+        "description": "Installing, updating, first-time setup"
+    }
+}

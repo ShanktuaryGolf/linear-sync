@@ -1,0 +1,11 @@
+[Unit]
+Description=Linear Pipeline Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/pipeline-kit
+EnvironmentFile=/path/to/pipeline-kit/.env
+ExecStart=/path/to/pipeline-kit/scripts/linear-sync.sh

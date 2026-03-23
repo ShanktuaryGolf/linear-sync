@@ -1,0 +1,16 @@
+[Unit]
+Description=Discord → Linear Pipeline Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pipeline-bot
+EnvironmentFile=/opt/pipeline-bot/.env
+ExecStart=/opt/pipeline-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
