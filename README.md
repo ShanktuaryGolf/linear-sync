@@ -43,7 +43,7 @@ Discord thread updated at every status change
 - **Linear** account (free tier works)
 - **Discord** server with a bot
 - **VPS** with a domain (for webhook — optional, bot works without it)
-- **Gas Town** installed ([github.com/anthropics/gas-town](https://github.com/anthropics/gas-town))
+- **Gas Town** installed ([GasTown]([https://github.com/anthropics/gas-town](https://github.com/steveyegge/gastown)))
 
 Optional agents (for code review rotation):
 - Gemini CLI (`npm i -g @anthropic-ai/gemini-cli` or similar)
