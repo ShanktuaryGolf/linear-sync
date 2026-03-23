@@ -11,7 +11,7 @@ This is a Discord + Linear + Multi-Agent CI pipeline kit. See README.md for full
 
 ## Gas Town Dependency
 
-The `scripts/linear-sync.sh` script depends on [Gas Town](https://github.com/anthropics/gas-town](https://github.com/steveyegge/gastown) for agent dispatch and lifecycle management. The Discord bot (`bot/`) does **not** require Gas Town — it only talks to Discord and Linear.
+The `scripts/linear-sync.sh` script depends on [Gas Town](https://github.com/steveyegge/gastown) for agent dispatch and lifecycle management. The Discord bot (`bot/`) does **not** require Gas Town — it only talks to Discord and Linear.
 
 **What linear-sync.sh calls:**
 - `gt sling <bead> <rig>` — Dispatch work to AI agents (polecats)

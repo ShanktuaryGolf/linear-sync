@@ -43,7 +43,7 @@ Discord thread updated at every status change
 - **Linear** account (free tier works)
 - **Discord** server with a bot
 - **VPS** with a domain (for webhook — optional, bot works without it)
-- **Gas Town** installed ([GasTown]([https://github.com/anthropics/gas-town](https://github.com/steveyegge/gastown)))
+- **Gas Town** installed ([github.com/steveyegge/gastown](https://github.com/steveyegge/gastown))
 
 Optional agents (for code review rotation):
 - Gemini CLI (`npm i -g @anthropic-ai/gemini-cli` or similar)
@@ -117,7 +117,7 @@ After the bot is deployed with a public URL:
 
 ### 6. Set up Gas Town (for AI agent dispatch)
 
-The sync timer uses [Gas Town](https://github.com/anthropics/gas-town) to dispatch
+The sync timer uses [Gas Town](https://github.com/steveyegge/gastown) to dispatch
 AI agents (polecats) and manage their lifecycle. The Discord bot does **not** need
 Gas Town — it only talks to Discord and Linear.
 
@@ -129,7 +129,7 @@ Gas Town — it only talks to Discord and Linear.
 
 ```bash
 # Install Gas Town
-# See: https://github.com/anthropics/gas-town
+# See: https://github.com/steveyegge/gastown
 
 # Start the Dolt database server (beads backend)
 gt dolt start
