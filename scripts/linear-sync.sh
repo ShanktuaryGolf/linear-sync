@@ -94,13 +94,27 @@ next_reviewer() {
 # ---------------------------------------------------------------------------
 log "Starting linear-sync"
 
-FINISHED_POLECATS=$(cd "$GT_ROOT" && gt polecat list --all 2>/dev/null | grep -E "idle|done" || true)
-if [ -n "$FINISHED_POLECATS" ]; then
-    echo "$FINISHED_POLECATS" | while read -r line; do
+ALL_POLECATS=$(cd "$GT_ROOT" && gt polecat list --all 2>/dev/null || true)
+if [ -n "$ALL_POLECATS" ]; then
+    echo "$ALL_POLECATS" | grep -E "●|○" | while read -r line; do
         polecat_name=$(echo "$line" | awk '{print $2}')
-        if [ -n "$polecat_name" ]; then
+        polecat_state=$(echo "$line" | awk '{print $3}')
+        if [ -z "$polecat_name" ]; then continue; fi
+
+        # Clean up finished polecats (idle/done)
+        if echo "$polecat_state" | grep -qE "idle|done"; then
             log "Cleaning up finished polecat: $polecat_name"
             cd "$GT_ROOT" && gt polecat nuke "$polecat_name" --force >> "$LOG_FILE" 2>&1 || true
+            continue
+        fi
+
+        # Clean up orphaned polecats (state=working but tmux session is dead)
+        if [ "$polecat_state" = "working" ]; then
+            session_name="sl-$(echo "$polecat_name" | sed 's|.*/||')"
+            if ! tmux has-session -t "$session_name" 2>/dev/null; then
+                log "Cleaning up orphaned polecat (dead session): $polecat_name"
+                cd "$GT_ROOT" && gt polecat nuke "$polecat_name" --force >> "$LOG_FILE" 2>&1 || true
+            fi
         fi
     done
 fi
