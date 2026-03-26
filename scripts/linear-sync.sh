@@ -95,8 +95,9 @@ next_reviewer() {
 log "Starting linear-sync"
 
 ALL_POLECATS=$(cd "$GT_ROOT" && gt polecat list --all 2>/dev/null || true)
-if [ -n "$ALL_POLECATS" ]; then
-    echo "$ALL_POLECATS" | grep -E "●|○" | while read -r line; do
+POLECAT_LINES=$(echo "$ALL_POLECATS" | grep -E "●|○" || true)
+if [ -n "$POLECAT_LINES" ]; then
+    echo "$POLECAT_LINES" | while read -r line; do
         polecat_name=$(echo "$line" | awk '{print $2}')
         polecat_state=$(echo "$line" | awk '{print $3}')
         if [ -z "$polecat_name" ]; then continue; fi
